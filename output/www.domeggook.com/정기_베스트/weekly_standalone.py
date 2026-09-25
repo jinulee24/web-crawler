@@ -248,7 +248,7 @@ def notion_upload_file(token: str, path: Path) -> str:
 
 
 def rt(text, url=None, bold=False):
-    span = {"type": "text", "text": {"content": text}}
+    span = {"type": "text", "text": {"content": str(text)}}  # 방어: 숫자/None 등 비-문자열이 와도 안전하게
     if url:
         span["text"]["link"] = {"url": url}
     ann = {}
@@ -339,6 +339,9 @@ def notion_append(token: str, page_id: str, blocks: list):
             json={"children": chunk},
             timeout=30,
         )
+        if r.status_code >= 300:
+            # 원인을 반드시 화면에 남긴다 — 이게 없으면 "400 Bad Request"라는 것만 알고 끝난다.
+            print(f"  [notion_append 실패] status={r.status_code} body={r.text[:1500]}")
         r.raise_for_status()
         time.sleep(0.3)
 
@@ -524,10 +527,19 @@ def main():
 
     print("[2/3] 노션 페이지 생성")
     page_id, page_url = notion_create_page(token, to_notion_props(properties), chunks[0])
-    for chunk in chunks[1:]:
-        notion_append(token, page_id, chunk)
+    append_failures = []
+    for idx, chunk in enumerate(chunks[1:], start=1):
+        try:
+            notion_append(token, page_id, chunk)
+        except Exception as e:
+            # 본문 한 덩어리가 실패해도 페이지 자체(+파일 첨부)는 이미 살아있다 —
+            # 나머지 덩어리는 계속 시도하고, 실패한 것만 기록해 끝까지 보고한다.
+            print(f"  [청크 {idx}/{len(chunks)-1} 추가 실패, 계속 진행] {e}")
+            append_failures.append(idx)
 
     problems = verify_page(token, page_id, expect_files=2, expect_tables=3)
+    if append_failures:
+        problems.append(f"본문 청크 {append_failures} 추가 실패 (위 로그의 [notion_append 실패] 참고)")
     if problems:
         print("  ⚠ 검증 경고:", "; ".join(problems))
     else:
