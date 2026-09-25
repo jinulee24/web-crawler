@@ -411,20 +411,21 @@ def build_notion_children(brief: dict, summary: dict, rising_rows, new_rows) -> 
 def send_gmail(subject: str, html_body: str, text_body: str, success: bool):
     addr = env("GMAIL_ADDRESS")
     app_pw = env("GMAIL_APP_PASSWORD")
-    to = os.environ.get("MAIL_TO", "jinu.lee24@gmail.com")
+    # MAIL_TO 는 콤마로 여러 주소를 넣을 수 있다 (예: "a@x.com, b@y.com")
+    to_list = [t.strip() for t in os.environ.get("MAIL_TO", "jinu.lee24@gmail.com").split(",") if t.strip()]
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = addr
-    msg["To"] = to
+    msg["To"] = ", ".join(to_list)
     msg.attach(MIMEText(text_body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    print(f"[3/3] 메일 발송: {to}")
+    print(f"[3/3] 메일 발송: {', '.join(t[:2] + '***' for t in to_list)}")  # 주소 일부만 로그에 남긴다
     with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
         s.starttls()
         s.login(addr, app_pw)
-        s.sendmail(addr, [to], msg.as_string())
+        s.sendmail(addr, to_list, msg.as_string())
 
 
 def html_table(headers, rows):
