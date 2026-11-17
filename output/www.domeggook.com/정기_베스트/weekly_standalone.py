@@ -1,46 +1,37 @@
-"""도매꾹 베스트 정기 수집 — 서버 단독 실행판 (Claude/MCP 없이 동작).
+"""도매꾹 베스트 정기 수집 — 메일 전용판 (Claude/MCP/노션 없이 동작).
 
-이 파일 하나로 지금까지 Claude 세션 안에서 하던 3단계를 그대로 재현한다:
-  1) crawl_script.py 실행 (수집 + 엑셀 2개 저장)  ← 기존 스크립트 그대로 재사용, 수정 없음
-  2) 노션 "🛒 도매꾹 Weekly Best" DB에 새 행 추가 (Notion REST API 직접 호출, 파일 2개 첨부)
-  3) Gmail 요약 메일 발송 (SMTP, 앱 비밀번호 사용)
+이 파일 하나로 아래 3단계를 수행한다:
+  1) crawl_script.py 실행 (수집 + 엑셀 2개 저장)
+  2) Claude API로 분석 리포트(Brief) 작성 (ANTHROPIC_API_KEY 없으면 숫자 템플릿)
+  3) Gmail(SMTP)로 분석 리포트 본문 + 엑셀 2개 첨부를 발송
 
-Claude Code 앱이 켜져 있을 필요가 없다. Python + 아래 환경변수만 있으면 어떤 서버(리눅스/윈도우)에서든
-cron / systemd timer / Task Scheduler 로 매주 월요일 08:00에 그대로 돌릴 수 있다.
+노션은 쓰지 않는다.
 
 ── 필요한 것 ──────────────────────────────────────────────────────────────
   pip install -r requirements.txt   (레포 루트에서, 최초 1회)
   pip install requests              (이 스크립트 전용 — requirements.txt 엔 없음)
 
   환경변수 (또는 이 파일과 같은 폴더의 weekly.env 파일에 KEY=VALUE 로 적어도 됨):
-    NOTION_TOKEN          필수. Notion 내부 통합(Internal Integration) 시크릿.
-                          https://www.notion.so/my-integrations 에서 발급 후,
-                          "🛒 도매꾹 Weekly Best" DB 페이지 ••• → 연결(Connections) 에 그 통합을 추가해야 함.
-                          (Claude 쪽 Notion 커넥터와는 별개 — 이 토큰은 이 스크립트 전용으로 새로 만든다.)
     GMAIL_ADDRESS         필수. 보내는 계정 (예: jinu.lee24@gmail.com)
     GMAIL_APP_PASSWORD    필수. Google 계정 → 보안 → 2단계 인증 켠 뒤 "앱 비밀번호" 발급 (16자리).
-                          일반 로그인 비밀번호 아님.
-    MAIL_TO               선택. 기본값 jinu.lee24@gmail.com
-    ANTHROPIC_API_KEY     선택. 있으면 Claude API로 Brief(한줄요약/한눈에/시사점)를 실제로 "써서" 채운다.
-                          없으면 숫자 기반 템플릿 문장으로 대체한다 (품질은 낮지만 무료·의존성 없음).
-    PYTHON_EXE             선택. crawl_script.py 를 실행할 python 경로. 기본값은 이 레포의 .venv.
-
-  스케줄 등록 예시는 파일 맨 아래 주석 참고.
+    MAIL_TO               선택. 받는 사람. 콤마로 여러 명 가능. 기본값 jinu.lee24@gmail.com
+    ANTHROPIC_API_KEY     선택. 있으면 Claude API로 Brief를 실제로 써서 채운다.
+    PYTHON_EXE            선택. crawl_script.py 를 실행할 python 경로. 기본값은 이 레포의 .venv.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import mimetypes
 import os
 import re
 import smtplib
 import subprocess
 import sys
-import time
 from datetime import datetime
+from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html import escape
 from pathlib import Path
 
 try:
@@ -54,11 +45,6 @@ REPO = HERE.parents[2]                                        # 레포 루트
 CRAWL_SCRIPT = HERE / "crawl_script.py"
 
 # ── 설정 ──────────────────────────────────────────────────────────────────
-NOTION_VERSION = os.environ.get("NOTION_VERSION", "2026-03-11")
-NOTION_DATA_SOURCE_ID = os.environ.get(
-    "NOTION_DATA_SOURCE_ID", "bf5a668f-4dee-4545-a06f-e6d3ffbff448"
-)
-NOTION_API = "https://api.notion.com/v1"
 WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
 RISE_THRESHOLD = 10
 
@@ -211,217 +197,32 @@ def build_brief(summary: dict) -> dict:
     return build_brief_template(summary)
 
 
-# ── Notion REST API ──────────────────────────────────────────────────────
+# ── 3. Gmail 발송 (본문 + 엑셀 첨부) ──────────────────────────────────────
 
-def notion_headers(token, json_body=True):
-    h = {"Authorization": f"Bearer {token}", "Notion-Version": NOTION_VERSION}
-    if json_body:
-        h["Content-Type"] = "application/json"
-    return h
-
-
-def notion_upload_file(token: str, path: Path) -> str:
-    """파일 업로드 3단계: 슬롯 생성 → 바이트 전송 → file_upload id 반환."""
-    ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    r = requests.post(
-        f"{NOTION_API}/file_uploads",
-        headers=notion_headers(token),
-        json={"mode": "single_part", "filename": path.name, "content_type": ctype},
-        timeout=30,
-    )
-    r.raise_for_status()
-    upload = r.json()
-    upload_id, upload_url = upload["id"], upload["upload_url"]
-
-    with open(path, "rb") as f:
-        r2 = requests.post(
-            upload_url,
-            headers=notion_headers(token, json_body=False),
-            files={"file": (path.name, f, ctype)},
-            timeout=120,
-        )
-    r2.raise_for_status()
-    status = r2.json().get("status")
-    if status != "uploaded":
-        raise RuntimeError(f"업로드 상태 이상: {r2.json()}")
-    return upload_id
-
-
-def rt(text, url=None, bold=False):
-    span = {"type": "text", "text": {"content": str(text)}}  # 방어: 숫자/None 등 비-문자열이 와도 안전하게
-    if url:
-        span["text"]["link"] = {"url": url}
-    ann = {}
-    if bold:
-        ann["bold"] = True
-    if ann:
-        span["annotations"] = ann
-    return span
-
-
-def heading2(text):
-    return {"object": "block", "type": "heading_2",
-            "heading_2": {"rich_text": [rt(text)]}}
-
-
-def paragraph(text):
-    return {"object": "block", "type": "paragraph",
-            "paragraph": {"rich_text": [rt(text)]}}
-
-
-def bulleted(text):
-    return {"object": "block", "type": "bulleted_list_item",
-            "bulleted_list_item": {"rich_text": [rt(text)]}}
-
-
-def file_block(file_upload_id):
-    return {"object": "block", "type": "file",
-            "file": {"type": "file_upload", "file_upload": {"id": file_upload_id}}}
-
-
-def table_block(headers, rows):
-    """rows: list[list[(text, url_or_None)]] — 각 셀 (표시문자열, 링크 or None)."""
-    def row_block(cells):
-        return {"object": "block", "type": "table_row",
-                "table_row": {"cells": [[rt(txt, url)] for txt, url in cells]}}
-
-    header_row = row_block([(h, None) for h in headers])
-    body_rows = [row_block(r) for r in rows]
-    return {
-        "object": "block",
-        "type": "table",
-        "table": {
-            "table_width": len(headers),
-            "has_column_header": True,
-            "has_row_header": False,
-            "children": [header_row] + body_rows,
-        },
-    }
-
-
-def notion_create_page(token: str, properties: dict, first_children: list) -> tuple[str, str]:
-    """스키마에 없는 속성은 하나씩 빼면서 재시도 — DB 스키마를 절대 바꾸지 않는다."""
-    props = dict(properties)
-    for _ in range(len(props) + 1):
-        body = {
-            "parent": {"type": "data_source_id", "data_source_id": NOTION_DATA_SOURCE_ID},
-            "properties": props,
-            "children": first_children,
-        }
-        r = requests.post(f"{NOTION_API}/pages", headers=notion_headers(token), json=body, timeout=30)
-        if r.status_code < 300:
-            data = r.json()
-            return data["id"], data["url"]
-        try:
-            msg = r.json().get("message", "")
-        except Exception:
-            msg = r.text
-        bad = None
-        for name in list(props.keys()):
-            if name in msg:
-                bad = name
-                break
-        if bad:
-            print(f"  속성 '{bad}' 를 스키마가 안 받아 제외하고 재시도: {msg[:150]}")
-            del props[bad]
-            continue
-        r.raise_for_status()
-    raise RuntimeError("페이지 생성 실패 — 속성을 다 빼도 안 됨")
-
-
-def notion_append(token: str, page_id: str, blocks: list):
-    # Notion append 는 한 번에 최대 100블록 — 안전하게 40개씩 나눠 보낸다.
-    for i in range(0, len(blocks), 40):
-        chunk = blocks[i:i + 40]
-        r = requests.patch(
-            f"{NOTION_API}/blocks/{page_id}/children",
-            headers=notion_headers(token),
-            json={"children": chunk},
-            timeout=30,
-        )
-        if r.status_code >= 300:
-            # 원인을 반드시 화면에 남긴다 — 이게 없으면 "400 Bad Request"라는 것만 알고 끝난다.
-            print(f"  [notion_append 실패] status={r.status_code} body={r.text[:1500]}")
-        r.raise_for_status()
-        time.sleep(0.3)
-
-
-def verify_page(token: str, page_id: str, expect_files: int, expect_tables: int) -> list[str]:
-    """등록 직후 실제로 반영됐는지 재조회로 확인한다. 문제 목록(빈 리스트=정상)을 반환."""
-    problems = []
-    r = requests.get(f"{NOTION_API}/blocks/{page_id}/children?page_size=100",
-                      headers=notion_headers(token), timeout=30)
-    r.raise_for_status()
-    blocks = r.json().get("results", [])
-    n_files = sum(1 for b in blocks if b.get("type") == "file")
-    n_tables = sum(1 for b in blocks if b.get("type") == "table")
-    if n_files < expect_files:
-        problems.append(f"첨부 파일 {n_files}/{expect_files}개만 확인됨")
-    if n_tables < expect_tables:
-        problems.append(f"표 블록 {n_tables}/{expect_tables}개만 확인됨")
-    return problems
-
-
-def build_notion_children(brief: dict, summary: dict, rising_rows, new_rows) -> list[list]:
-    """append 호출 단위로 나눠서 반환 (파일 첨부부터 순서대로)."""
-    cat_headers = ["카테고리", "수집", f"▲{RISE_THRESHOLD}+", "NEW", "가격비공개"]
-    cat_rows = [
-        [(cat, None), (str(v["total"]), None), (str(v["rise10"]), None),
-         (str(v["new"]), None), (str(v["price_hidden"]), None)]
-        for cat, v in summary["per_category"].items()
-    ]
-    cat_rows.append([
-        ("합계", None), (str(summary["total"]), None), (str(summary["rise10_total"]), None),
-        (str(summary["new_total"]), None),
-        (str(sum(v["price_hidden"] for v in summary["per_category"].values())), None),
-    ])
-
-    rising_headers = ["#", "카테고리", "순위", "변동", "상품명", "판매가"]
-    rising_table_rows = [
-        [(str(i), None), (r["카테고리명"], None), (str(r["랭킹"]), None), (r["순위변동"], None),
-         (clean_name(r["상품명"]), r["상품URL"]), (price_str(r["판매가격"]), None)]
-        for i, r in enumerate(rising_rows, 1)
-    ]
-
-    new_headers = ["#", "카테고리", "진입순위", "상품명", "판매가"]
-    new_table_rows = [
-        [(str(i), None), (r["카테고리명"], None), (str(r["랭킹"]), None),
-         (clean_name(r["상품명"]), r["상품URL"]), (price_str(r["판매가격"]), None)]
-        for i, r in enumerate(new_rows, 1)
-    ]
-
-    chunks = []
-    chunks.append(["__FILES__"])  # placeholder — 실제 file_upload id는 main()에서 채운다
-    chunks.append(
-        [heading2("1. Executive Summary")] + [bulleted(b) for b in brief["highlights"]]
-    )
-    chunks.append([heading2("2. 카테고리별 현황"), table_block(cat_headers, cat_rows)])
-    chunks.append([heading2("3. 급상승 TOP 30"), table_block(rising_headers, rising_table_rows)])
-    chunks.append([heading2("4. NEW 진입 TOP 30"), table_block(new_headers, new_table_rows)])
-    chunks.append([heading2("5. 시사점")] + [bulleted(b) for b in brief["insights"]])
-    issues = summary.get("validation_issues") or []
-    pii = summary.get("pii_warnings") or []
-    if issues or pii:
-        chunks.append([heading2("6. 검증 경고")] + [bulleted(x) for x in (issues + pii)])
-    return chunks
-
-
-# ── 3. Gmail 발송 ────────────────────────────────────────────────────────
-
-def send_gmail(subject: str, html_body: str, text_body: str, success: bool):
+def send_gmail(subject: str, html_body: str, text_body: str, attachments: list[Path] | None = None):
     addr = env("GMAIL_ADDRESS")
     app_pw = env("GMAIL_APP_PASSWORD")
     # MAIL_TO 는 콤마로 여러 주소를 넣을 수 있다 (예: "a@x.com, b@y.com")
     to_list = [t.strip() for t in os.environ.get("MAIL_TO", "jinu.lee24@gmail.com").split(",") if t.strip()]
 
-    msg = MIMEMultipart("alternative")
+    msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
     msg["From"] = addr
     msg["To"] = ", ".join(to_list)
-    msg.attach(MIMEText(text_body, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    print(f"[3/3] 메일 발송: {', '.join(t[:2] + '***' for t in to_list)}")  # 주소 일부만 로그에 남긴다
+    body = MIMEMultipart("alternative")
+    body.attach(MIMEText(text_body, "plain", "utf-8"))
+    body.attach(MIMEText(html_body, "html", "utf-8"))
+    msg.attach(body)
+
+    for path in attachments or []:
+        part = MIMEApplication(Path(path).read_bytes(),
+                               _subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        # 한글 파일명은 RFC 2231 로 인코딩해야 메일 클라이언트에서 안 깨진다
+        part.add_header("Content-Disposition", "attachment", filename=("utf-8", "", Path(path).name))
+        msg.attach(part)
+
+    print(f"[3/3] 메일 발송: {', '.join(t[:2] + '***' for t in to_list)} (첨부 {len(attachments or [])}개)")
     with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
         s.starttls()
         s.login(addr, app_pw)
@@ -429,12 +230,59 @@ def send_gmail(subject: str, html_body: str, text_body: str, success: bool):
 
 
 def html_table(headers, rows):
-    th = "".join(f"<th style='border:1px solid #ccc;padding:4px 8px'>{h}</th>" for h in headers)
+    """rows 의 셀은 이미 HTML 로 안전하게 만들어진 문자열(또는 숫자)이어야 한다."""
+    th = "".join(f"<th style='border:1px solid #ccc;padding:4px 8px;background:#f3f3f3'>{h}</th>" for h in headers)
     trs = []
     for row in rows:
         tds = "".join(f"<td style='border:1px solid #ccc;padding:4px 8px'>{c}</td>" for c in row)
         trs.append(f"<tr>{tds}</tr>")
-    return f"<table style='border-collapse:collapse'><tr>{th}</tr>{''.join(trs)}</table>"
+    return f"<table style='border-collapse:collapse;font-size:13px'><tr>{th}</tr>{''.join(trs)}</table>"
+
+
+def build_report(summary: dict, brief: dict, now: datetime) -> tuple[str, str, str]:
+    """(제목, HTML 본문, 평문 본문) — 분석 리포트."""
+    weekday = WEEKDAY_KO[now.weekday()]
+    rising_rows = summary["brief_candidates_rising"]
+    new_rows = summary["brief_candidates_new"]
+    e = escape
+
+    subject = f"[도매꾹 베스트] {now.strftime('%Y-%m-%d')} ({weekday}) — {brief['one_liner']}"
+    overview = (f"수집 {summary['run_at']} · 5개 카테고리(가전 제외) × 1~150위 · 전체 {summary['total']}건 · "
+                f"급상승(▲{RISE_THRESHOLD}+) {summary['rise10_total']}건 · NEW {summary['new_total']}건 · "
+                f"실패 카테고리 {', '.join(summary['failed_categories']) or '없음'}")
+
+    cat_rows = [[e(c), v["total"], v["rise10"], v["new"], v["price_hidden"]]
+                for c, v in summary["per_category"].items()]
+    warnings = (summary.get("validation_issues") or []) + (summary.get("pii_warnings") or [])
+
+    html = (
+        f"<h2>도매꾹 베스트 주간 리포트</h2><p>{e(overview)}</p>"
+        f"<h3>이번 회차 한눈에</h3><ul>{''.join(f'<li>{e(str(b))}</li>' for b in brief['highlights'])}</ul>"
+        f"<h3>카테고리별 현황</h3>"
+        + html_table(["카테고리", "수집", f"▲{RISE_THRESHOLD}+", "NEW", "가격비공개"], cat_rows)
+        + "<h3>급상승 TOP 30</h3>"
+        + html_table(
+            ["#", "카테고리", "순위", "변동", "상품명", "판매가"],
+            [[i, e(r["카테고리명"]), r["랭킹"], e(r["순위변동"]),
+              f"<a href='{e(r['상품URL'])}'>{e(clean_name(r['상품명']))}</a>", price_str(r["판매가격"])]
+             for i, r in enumerate(rising_rows, 1)])
+        + "<h3>NEW 진입 TOP 30</h3>"
+        + html_table(
+            ["#", "카테고리", "진입순위", "상품명", "판매가"],
+            [[i, e(r["카테고리명"]), r["랭킹"],
+              f"<a href='{e(r['상품URL'])}'>{e(clean_name(r['상품명']))}</a>", price_str(r["판매가격"])]
+             for i, r in enumerate(new_rows, 1)])
+        + f"<h3>시사점</h3><ul>{''.join(f'<li>{e(str(b))}</li>' for b in brief['insights'])}</ul>"
+        + (f"<h3>검증 경고</h3><ul>{''.join(f'<li>{e(str(w))}</li>' for w in warnings)}</ul>" if warnings else "")
+        + "<p>📎 첨부: 전체 목록 엑셀(카테고리별 시트 포함) · 급상승(▲10+)/NEW 엑셀</p>"
+    )
+
+    lines = [overview, "", "[이번 회차 한눈에]"] + [f"- {b}" for b in brief["highlights"]]
+    lines += ["", "[시사점]"] + [f"- {b}" for b in brief["insights"]]
+    if warnings:
+        lines += ["", "[검증 경고]"] + [f"- {w}" for w in warnings]
+    lines += ["", "첨부: 전체 목록 엑셀 · 급상승/NEW 엑셀", "(상세 표는 HTML 메일 본문과 엑셀을 확인하세요)"]
+    return subject, html, "\n".join(lines)
 
 
 # ── main ──────────────────────────────────────────────────────────────────
@@ -442,7 +290,7 @@ def html_table(headers, rows):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true",
-                     help="수집은 실제로 하되 노션 등록·메일 발송 없이 내용만 출력")
+                    help="수집·분석은 실제로 하되 메일 발송 없이 내용만 출력")
     args = ap.parse_args()
 
     _load_dotenv()
@@ -455,128 +303,28 @@ def main():
         if not args.dry_run:
             send_gmail(
                 f"[도매꾹 베스트] {today} 수집 실패",
-                f"<p>{e}</p><p>우회는 시도하지 않았음.</p>",
+                f"<p>{escape(str(e))}</p><p>우회는 시도하지 않았음.</p>",
                 f"{e}\n우회는 시도하지 않았음.",
-                success=False,
             )
         raise
 
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     brief = build_brief(summary)
-
-    now = datetime.now()
-    weekday = WEEKDAY_KO[now.weekday()]
-    title = f"{now.strftime('%Y-%m-%d')} ({weekday}) 도매꾹 베스트"
-    reason = (f"{brief['one_liner']} — 전체 {summary['total']} · "
-              f"급상승(▲{RISE_THRESHOLD}+) {summary['rise10_total']} · NEW {summary['new_total']}")
-
-    properties = {
-        "상품명": {"title": [rt(title)]},
-        "추천 이유": {"rich_text": [rt(reason)]},
-        "링크": {"url": "https://www.domeggook.com/main/item/itemPopular.php?cat=01_00"},
-        "date:큐레이션 주차:start": now.strftime("%Y-%m-%d"),
-        "date:큐레이션 주차:is_datetime": 0,
-    }
-    # notion_create_page 는 dict of {name: {...notion property value...}} 를 그대로 pages API에 보낸다.
-    # 위에서 date: 접두 키는 편의상 우리 내부 표기이므로 실제 전송 전에 변환한다.
-    def to_notion_props(props):
-        out = {}
-        date_val = {}
-        for k, v in props.items():
-            if k.startswith("date:"):
-                _, field, part = k.split(":")
-                date_val.setdefault(field, {})[part] = v
-            else:
-                out[k] = v
-        for field, parts in date_val.items():
-            out[field] = {"date": {"start": parts.get("start"),
-                                    "end": None}}
-            # is_datetime 은 Notion Pages API 표준 필드가 아니라 표시 방식 문제라 별도 처리 불필요.
-        return out
-
-    all_xlsx = Path(summary["all_xlsx"])
-    highlight_xlsx = Path(summary["highlight_xlsx"])
-    rising_rows = summary["brief_candidates_rising"]
-    new_rows = summary["brief_candidates_new"]
-    chunks = build_notion_children(brief, summary, rising_rows, new_rows)
+    attachments = [Path(summary["all_xlsx"]), Path(summary["highlight_xlsx"])]
+    subject, html, text = build_report(summary, brief, datetime.now())
 
     if args.dry_run:
-        print("\n=== DRY RUN — 노션/메일 생략, 내용만 출력 ===")
-        print("제목:", title)
-        print("추천 이유:", reason)
-        print("업로드 예정 파일:", all_xlsx.name, highlight_xlsx.name)
+        print("\n=== DRY RUN — 메일 발송 생략, 내용만 출력 ===")
+        print("제목:", subject)
+        print("첨부 예정:", ", ".join(p.name for p in attachments))
         print(json.dumps(brief, ensure_ascii=False, indent=2))
         return
 
-    token = env("NOTION_TOKEN")
-    print("[2/3] 노션 파일 업로드")
-    file_id_all = notion_upload_file(token, all_xlsx)
-    file_id_hl = notion_upload_file(token, highlight_xlsx)
-
-    first_chunk_idx = next(i for i, c in enumerate(chunks) if c == ["__FILES__"])
-    chunks[first_chunk_idx] = [
-        heading2("📎 이번 회차 파일"),
-        file_block(file_id_all),
-        file_block(file_id_hl),
-        paragraph(
-            f"수집 {summary['run_at']} · 5개 카테고리(가전 제외) × 1~150위 · "
-            f"전체 {summary['total']}건 · 급상승(▲{RISE_THRESHOLD} 이상) {summary['rise10_total']}건 · "
-            f"NEW {summary['new_total']}건 · 실패 카테고리 "
-            f"{', '.join(summary['failed_categories']) or '없음'}"
-        ),
-    ]
-
-    print("[2/3] 노션 페이지 생성")
-    page_id, page_url = notion_create_page(token, to_notion_props(properties), chunks[0])
-    append_failures = []
-    for idx, chunk in enumerate(chunks[1:], start=1):
-        try:
-            notion_append(token, page_id, chunk)
-        except Exception as e:
-            # 본문 한 덩어리가 실패해도 페이지 자체(+파일 첨부)는 이미 살아있다 —
-            # 나머지 덩어리는 계속 시도하고, 실패한 것만 기록해 끝까지 보고한다.
-            print(f"  [청크 {idx}/{len(chunks)-1} 추가 실패, 계속 진행] {e}")
-            append_failures.append(idx)
-
-    problems = verify_page(token, page_id, expect_files=2, expect_tables=3)
-    if append_failures:
-        problems.append(f"본문 청크 {append_failures} 추가 실패 (위 로그의 [notion_append 실패] 참고)")
-    if problems:
-        print("  ⚠ 검증 경고:", "; ".join(problems))
-    else:
-        print("  ✓ 재조회 확인: 파일 2개·표 3개 정상 반영")
-
-    subject = f"[도매꾹 베스트] {now.strftime('%Y-%m-%d')} ({weekday}) — {brief['one_liner']}"
-    html = (
-        f"<p>{reason}</p>"
-        f"<h3>이번 회차 한눈에</h3><ul>{''.join(f'<li>{b}</li>' for b in brief['highlights'])}</ul>"
-        f"<h3>급상승 TOP 30</h3>"
-        + html_table(
-            ["#", "카테고리", "순위", "변동", "상품명", "판매가"],
-            [[i, r["카테고리명"], r["랭킹"], r["순위변동"],
-              f"<a href='{r['상품URL']}'>{clean_name(r['상품명'])}</a>", price_str(r["판매가격"])]
-             for i, r in enumerate(rising_rows, 1)],
-        )
-        + "<h3>NEW 진입 TOP 30</h3>"
-        + html_table(
-            ["#", "카테고리", "진입순위", "상품명", "판매가"],
-            [[i, r["카테고리명"], r["랭킹"],
-              f"<a href='{r['상품URL']}'>{clean_name(r['상품명'])}</a>", price_str(r["판매가격"])]
-             for i, r in enumerate(new_rows, 1)],
-        )
-        + f"<h3>시사점</h3><ul>{''.join(f'<li>{b}</li>' for b in brief['insights'])}</ul>"
-        + f"<p>노션: <a href='{page_url}'>{page_url}</a></p>"
-        + f"<p>로컬 파일: {all_xlsx}<br>{highlight_xlsx}</p>"
-    )
-    text = (
-        f"{reason}\n\n노션: {page_url}\n로컬 파일:\n{all_xlsx}\n{highlight_xlsx}\n"
-    )
-    send_gmail(subject, html, text, success=True)
+    send_gmail(subject, html, text, attachments)
 
     print(f"\n완료 — RUN_DIR={run_dir}")
     print(f"총 {summary['total']}건 / 급상승 {summary['rise10_total']} / NEW {summary['new_total']}")
-    print(f"노션: {page_url}")
-    print("메일: 발송됨" if not problems else f"메일: 발송됨 (노션 검증 경고 있음: {problems})")
+    print("메일: 발송됨 (본문 리포트 + 엑셀 2개 첨부)")
 
 
 if __name__ == "__main__":
@@ -621,5 +369,6 @@ if __name__ == "__main__":
 #     /RL HIGHEST
 #   → "사용자 로그온 여부와 관계없이 실행" 체크(속성 창)해야 컴퓨터에 아무도 로그인 안 해도 돈다.
 #
-# 공통: weekly.env 파일에 NOTION_TOKEN / GMAIL_ADDRESS / GMAIL_APP_PASSWORD 를 적어 두면
+# 공통: weekly.env 파일에 GMAIL_ADDRESS / GMAIL_APP_PASSWORD 를 적어 두면
 #       이 스크립트가 실행 시점에 자동으로 읽는다 (systemd는 EnvironmentFile= 로 직접 지정).
+
